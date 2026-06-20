@@ -1,0 +1,39 @@
+# Python compilation files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Sensitive data / Session credentials (CRITICAL: Do not upload these!)
+cookies.txt
+client_secrets.json
+token.json
+browser_data/
+browser_data_facebook/
+browser_data_instagram/
+browser_data_meta/
+browser_data_tiktok/
+
+# Temporary directories for video processing
+temp_videos/
+temp_clips/
+
+# Logs and local configurations/states
+automacao.log
+historico.json
+source_schedules.json
+authorized_sources.txt
+debug_screenshots/
+
+# Local IDE settings
+.vscode/
+.idea/
+
+# OS-specific files
+.DS_Store
+Thumbs.db

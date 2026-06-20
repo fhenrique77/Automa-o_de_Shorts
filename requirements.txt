@@ -1,0 +1,6 @@
+yt-dlp>=2024.8.6
+youtube-transcript-api>=1.2.2
+imageio-ffmpeg>=0.5.1
+playwright>=1.42.0
+google-genai>=1.0.0
+openai-whisper>=20240930
