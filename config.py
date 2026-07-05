@@ -106,3 +106,11 @@ FFMPEG_PRESET = "ultrafast"
 FFMPEG_THREADS = 1
 FFMPEG_CRF = 20
 AUDIO_BITRATE = "160k"
+
+# --- Anti-Detecção de Vídeo (TikTok Content ID bypass) ---
+# Aplica transformações sutis ao vídeo para invalidar o hash perceptual
+# usado pelo TikTok para identificar conteúdo repostado.
+ANTI_DETECTION_ENABLED = True
+ANTI_DETECTION_HFLIP = True                 # Espelhamento horizontal
+ANTI_DETECTION_SPEED_RANGE = (1.03, 1.07)   # Faixa de micro-aceleração
+ANTI_DETECTION_ZOOM_RANGE = (0.02, 0.05)    # Faixa de zoom (% de crop nas bordas)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import random
 import re
 import time as time_module
 from pathlib import Path
@@ -46,10 +47,19 @@ def upload_videos(
 	delay_seconds = max(0.0, float(RETRY_DELAY_SECONDS))
 
 	with sync_playwright() as p:
+		_viewport = {
+			"width": random.randint(1250, 1400),
+			"height": random.randint(750, 850),
+		}
 		context = p.chromium.launch_persistent_context(
 			user_data_dir=str(TIKTOK_USER_DATA_DIR),
 			headless=HEADLESS_MODE,
-			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+			viewport=_viewport,
+			user_agent=(
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+				"AppleWebKit/537.36 (KHTML, like Gecko) "
+				f"Chrome/{random.randint(135, 137)}.0.0.0 Safari/537.36"
+			),
 			args=[
 				"--disable-blink-features=AutomationControlled",
 				"--mute-audio",
@@ -58,8 +68,11 @@ def upload_videos(
 				"--no-default-browser-check",
 				"--disable-gpu",
 				"--disable-dev-shm-usage",
+				"--disable-infobars",
+				"--disable-component-extensions-with-background-pages",
 			],
 		)
+		context.add_init_script(_STEALTH_JS)
 
 		try:
 			page = context.new_page()
@@ -154,7 +167,7 @@ def _open_upload_home(page) -> None:
 	page.goto(TIKTOK_UPLOAD_URL)
 	page.wait_for_load_state("domcontentloaded")
 	_dismiss_unsaved_draft_prompt(page)
-	page.wait_for_timeout(1000)
+	page.wait_for_timeout(random.randint(1500, 3500))
 
 
 def _wait_for_upload_form(page) -> None:
@@ -255,6 +268,8 @@ def _upload_single_video(
 	title: str,
 	caption: str,
 ) -> None:
+	_humanize_session(page)
+
 	print("Iniciando upload no TikTok...")
 	select_button = _first_visible_locator(
 		page,
@@ -275,6 +290,8 @@ def _upload_single_video(
 		page.wait_for_selector("text=Substituir", timeout=300000)
 	except Exception:
 		pass
+
+	page.wait_for_timeout(random.randint(2000, 4000))
 
 	print("Preenchendo legenda do TikTok...")
 	caption_box = _first_visible_locator(
@@ -301,26 +318,26 @@ def _upload_single_video(
 		],
 		timeout_ms=300000,
 	)
-	page.wait_for_timeout(3000)
+	page.wait_for_timeout(random.randint(2500, 5000))
 	
 	try:
 		post_button.click(timeout=5000)
 	except Exception:
 		post_button.dispatch_event("click")
 		
-	page.wait_for_timeout(3000)
+	page.wait_for_timeout(random.randint(2000, 5000))
 
 	print("Aguardando confirmacao do TikTok...")
 	_confirm_tiktok_post(page)
 	try:
 		post_button.wait_for(state="hidden", timeout=5000)
 	except Exception:
-		page.wait_for_timeout(3000)
+		page.wait_for_timeout(random.randint(2000, 4000))
 
 	_verify_tiktok_publication(page, title)
 
 	print("Upload concluido com sucesso via TikTok!")
-	page.wait_for_timeout(2000)
+	page.wait_for_timeout(random.randint(2000, 4000))
 
 
 def _fill_caption_editor(page, caption_box, caption: str) -> None:
@@ -330,13 +347,18 @@ def _fill_caption_editor(page, caption_box, caption: str) -> None:
 
 	for attempt in range(1, 4):
 		caption_box.click(timeout=10000, force=True)
+		page.wait_for_timeout(random.randint(300, 800))
 		page.keyboard.press("Control+a")
+		page.wait_for_timeout(random.randint(200, 500))
 		page.keyboard.press("Backspace")
-		page.wait_for_timeout(500)
-		caption_box.fill(caption)
-		page.wait_for_timeout(1000)
+		page.wait_for_timeout(random.randint(400, 900))
+
+		# Digita em blocos para simular comportamento humano
+		_human_type_text(page, caption)
+
+		page.wait_for_timeout(random.randint(800, 1500))
 		page.keyboard.press("Tab")
-		page.wait_for_timeout(1000)
+		page.wait_for_timeout(random.randint(800, 1500))
 
 		last_caption = _normalize_caption_text(caption_box.inner_text())
 		if not expected_caption or last_caption == expected_caption:
@@ -388,7 +410,7 @@ def _confirm_tiktok_post(page) -> None:
 		confirmation_button.click(timeout=5000)
 	except Exception:
 		confirmation_button.dispatch_event("click")
-	page.wait_for_timeout(8000)
+	page.wait_for_timeout(random.randint(6000, 10000))
 
 
 def _verify_tiktok_publication(page, title: str, timeout_ms: int = 60000) -> None:
@@ -419,4 +441,78 @@ def _first_visible_locator(page, selectors: Sequence[str], timeout_ms: int):
 	raise RuntimeError(
 		f"Nao foi possivel localizar elemento visivel entre: {', '.join(selectors)}"
 	) from last_error
+
+
+# ---------------------------------------------------------------------------
+#  Stealth JS — injeta script anti-fingerprint em cada página
+# ---------------------------------------------------------------------------
+_STEALTH_JS = """
+// Oculta navigator.webdriver (flag principal de detecção de bots)
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+
+// Simula plugins reais do Chrome
+Object.defineProperty(navigator, 'plugins', {
+    get: () => {
+        const plugins = [
+            {name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+            {name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: ''},
+            {name: 'Native Client', filename: 'internal-nacl-plugin', description: ''},
+        ];
+        plugins.length = 3;
+        return plugins;
+    }
+});
+
+// Define idiomas consistentes com o mercado BR
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['pt-BR', 'pt', 'en-US', 'en']
+});
+
+// Simula chrome.runtime (presente em navegadores reais)
+if (!window.chrome) window.chrome = {};
+if (!window.chrome.runtime) window.chrome.runtime = {};
+
+// Corrige permissions API para não vazar automação
+try {
+    const originalQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
+    window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+            ? Promise.resolve({state: Notification.permission})
+            : originalQuery(parameters);
+} catch(e) {}
+"""
+
+
+def _humanize_session(page) -> None:
+	"""Simula comportamento humano antes de interagir com a página."""
+	page.wait_for_timeout(random.randint(1500, 3500))
+
+	# Movimentos de mouse aleatórios
+	for _ in range(random.randint(2, 5)):
+		page.mouse.move(
+			random.randint(100, 900),
+			random.randint(100, 600),
+		)
+		page.wait_for_timeout(random.randint(150, 500))
+
+	# Rola a página suavemente
+	page.mouse.wheel(0, random.randint(50, 250))
+	page.wait_for_timeout(random.randint(400, 1200))
+	page.mouse.wheel(0, -random.randint(20, 150))
+	page.wait_for_timeout(random.randint(300, 800))
+
+
+def _human_type_text(page, text: str) -> None:
+	"""
+	Digita texto em blocos de tamanho aleatório com pausas naturais,
+	simulando velocidade de digitação humana.
+	"""
+	pos = 0
+	while pos < len(text):
+		chunk_size = random.randint(5, 20)
+		chunk = text[pos : pos + chunk_size]
+		page.keyboard.type(chunk, delay=random.randint(20, 60))
+		pos += chunk_size
+		if pos < len(text):
+			page.wait_for_timeout(random.randint(80, 300))
 

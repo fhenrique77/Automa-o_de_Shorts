@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import random
 import re
 import unicodedata
 import threading
@@ -12,6 +13,10 @@ import json
 from typing import Any
 
 from config import (
+    ANTI_DETECTION_ENABLED,
+    ANTI_DETECTION_HFLIP,
+    ANTI_DETECTION_SPEED_RANGE,
+    ANTI_DETECTION_ZOOM_RANGE,
     AUDIO_BITRATE,
     CLIP_COUNT,
     CLIP_MAX_DURATION,
@@ -586,13 +591,55 @@ def cut_clip(
     ]
 
     if vertical:
+        vf_filters: list[str] = []
+        af_filters: list[str] = []
+
+        if ANTI_DETECTION_ENABLED:
+            # 1. Zoom sutil — recorta bordas para invalidar hash perceptual
+            zoom = random.uniform(*ANTI_DETECTION_ZOOM_RANGE)
+            crop_factor = 1 - zoom
+            vf_filters.append(f"crop=iw*{crop_factor:.4f}:ih*{crop_factor:.4f}")
+
+        # Redimensiona para formato vertical (mantém proporção + barras)
+        vf_filters.append(
+            f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease"
+        )
+        vf_filters.append(
+            f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
+        )
+
+        if ANTI_DETECTION_ENABLED:
+            # 2. Espelhamento horizontal — inverte a imagem completamente
+            if ANTI_DETECTION_HFLIP:
+                vf_filters.append("hflip")
+
+            # 3. Correção de cor sutil (valores randomizados a cada execução)
+            brightness = random.uniform(0.01, 0.04)
+            contrast = random.uniform(1.01, 1.04)
+            saturation = random.uniform(1.02, 1.08)
+            vf_filters.append(
+                f"eq=brightness={brightness:.3f}:contrast={contrast:.3f}:saturation={saturation:.3f}"
+            )
+
+            # 4. Micro-aceleração — muda fingerprint temporal do vídeo
+            speed_factor = random.uniform(*ANTI_DETECTION_SPEED_RANGE)
+            vf_filters.append(f"setpts=PTS/{speed_factor:.4f}")
+
+            # 5. Velocidade do áudio correspondente
+            af_filters.append(f"atempo={speed_factor:.4f}")
+
+            print(
+                f"  Anti-detecção aplicada: zoom={zoom:.3f}, speed={speed_factor:.3f}, "
+                f"brightness={brightness:.3f}, hflip={ANTI_DETECTION_HFLIP}"
+            )
+
+        command.extend(["-vf", ",".join(vf_filters)])
+
+        if af_filters:
+            command.extend(["-af", ",".join(af_filters)])
+
         command.extend(
             [
-                "-vf",
-                (
-                    f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,"
-                    f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
-                ),
                 "-c:v",
                 "libx264",
                 "-preset",
