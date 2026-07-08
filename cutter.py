@@ -753,10 +753,32 @@ def _build_summary(title: str, text: str) -> str:
     else:
         summary = title.strip()
 
-    summary = summary[:220].rstrip()
-    if summary and summary[-1] not in ".!?":
-        summary = summary.rstrip(",;:")
+    summary = _truncate_at_boundary(summary, 220)
     return summary
+
+
+def _truncate_at_boundary(text: str, limit: int) -> str:
+    """Trunca texto respeitando limites de frase ou palavra, nunca no meio."""
+    if len(text) <= limit:
+        return text
+
+    # Tenta cortar na ultima frase completa
+    truncated = text[:limit]
+    for end_char in (". ", "! ", "? "):
+        last_pos = truncated.rfind(end_char)
+        if last_pos > limit // 3:  # Garante que nao perca conteudo demais
+            return truncated[: last_pos + 1].rstrip()
+
+    # Fallback: corta na ultima palavra completa
+    last_space = truncated.rfind(" ")
+    if last_space > limit // 3:
+        result = truncated[:last_space].rstrip()
+    else:
+        result = truncated.rstrip()
+
+    # Remove pontuacao solta no final
+    result = result.rstrip(",;:-")
+    return result
 
 
 def _build_description(title: str, summary: str, hashtags: list[str]) -> str:
@@ -767,6 +789,7 @@ def _build_description(title: str, summary: str, hashtags: list[str]) -> str:
     title_emoji = template["title_emoji"]
     summary_emoji = template["summary_emoji"]
     cta = template["cta"]
+    hashtag_line = " ".join(hashtags)
 
     lines = [
         f"{title_emoji} {title.strip()}",
@@ -775,11 +798,29 @@ def _build_description(title: str, summary: str, hashtags: list[str]) -> str:
         "",
         cta,
         "",
-        " ".join(hashtags)
+        hashtag_line,
     ]
     description = "\n".join(lines)
+
     if len(description) > DESCRIPTION_MAX_CHARS:
-        description = description[:DESCRIPTION_MAX_CHARS].rstrip()
+        # Encurta o summary para caber, mantendo titulo + CTA + hashtags intactos
+        fixed_parts = f"{title_emoji} {title.strip()}\n\n{summary_emoji} \n\n{cta}\n\n{hashtag_line}"
+        available = DESCRIPTION_MAX_CHARS - len(fixed_parts)
+        if available > 30:
+            short_summary = _truncate_at_boundary(summary.strip(), available)
+        else:
+            short_summary = ""
+        lines = [
+            f"{title_emoji} {title.strip()}",
+            "",
+            f"{summary_emoji} {short_summary}",
+            "",
+            cta,
+            "",
+            hashtag_line,
+        ]
+        description = "\n".join(lines)
+
     return description
 
 

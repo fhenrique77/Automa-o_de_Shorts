@@ -47,7 +47,7 @@ YOUTUBE_CATEGORY_ID = "22"
 YOUTUBE_PRIVACY_STATUS = "public"
 YOUTUBE_UPLOAD_ENABLED = True
 
-TIKTOK_UPLOAD_ENABLED = True
+TIKTOK_UPLOAD_ENABLED = False  # Desativado temporariamente — conta nova aquecendo
 TIKTOK_UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload?from=webapp&lang=pt-BR"
 TIKTOK_LOGIN_URL = "https://www.tiktok.com/login/phone-or-email/email?lang=pt-BR"
 TIKTOK_USER_DATA_DIR = BASE_DIR / "browser_data_tiktok"

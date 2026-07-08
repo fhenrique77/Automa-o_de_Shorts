@@ -217,12 +217,23 @@ def build_social_caption(title: str, description: str, limit: int, tags: list[st
     
     if tags:
         caption_lower = caption.lower()
-        missing_tags = [tag for tag in tags if tag.strip() and tag.lower() not in caption_lower]
+        missing_tags = [
+            tag for tag in tags
+            if tag.strip() and tag.lower() not in caption_lower
+        ]
         if not caption and missing_tags:
             caption = " ".join(missing_tags)
         elif missing_tags:
             caption = f"{caption}\n\n{' '.join(missing_tags)}"
             
     if len(caption) > limit:
-        caption = caption[:limit].rstrip()
+        # Trunca na ultima palavra completa, nunca no meio
+        truncated = caption[:limit]
+        last_newline = truncated.rfind("\n")
+        last_space = truncated.rfind(" ")
+        cut_point = max(last_newline, last_space)
+        if cut_point > limit // 3:
+            caption = truncated[:cut_point].rstrip()
+        else:
+            caption = truncated.rstrip()
     return caption
