@@ -11,6 +11,7 @@ print("=======================================================\n")
 
 with sync_playwright() as p:
     context = p.chromium.launch_persistent_context(
+        channel="chrome",
         user_data_dir=str(FACEBOOK_USER_DATA_DIR),
         headless=False,
         args=[

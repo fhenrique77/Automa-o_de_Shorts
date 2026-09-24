@@ -43,6 +43,7 @@ VBS_PATH = str(Path(WORK_DIR) / "run_bot_silent.vbs")
 #   17h45 → pré-pico noturno TikTok (17h-19h) — máxima eficiência anti-saturação
 #   20h15 → rolagem noturna (19h-22h) — zona dourada entretenimento BR
 HORARIOS = [
+    "11:30",
     "16:45",
     "18:30",
 ]

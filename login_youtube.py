@@ -14,9 +14,9 @@ print("=======================================================\n")
 
 with sync_playwright() as p:
     context = p.chromium.launch_persistent_context(
+        channel="chrome",
         user_data_dir=str(USER_DATA_DIR),
         headless=False,
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
         locale="pt-BR",
         args=[
             "--disable-blink-features=AutomationControlled",

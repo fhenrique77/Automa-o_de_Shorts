@@ -17,10 +17,13 @@ import importlib
 import json
 import random
 import time as time_module
-import shutil
 from pathlib import Path
 from datetime import datetime, time
+from uuid import uuid4
 from config import (
+    BASE_DIR,
+    PUBLICATION_DB,
+    HISTORY_FILE,
     ALLOW_WHISPER_FALLBACK,
     AUTO_SELECT_CLIPS,
     AUTHORIZED_SOURCE_URLS,
@@ -31,6 +34,8 @@ from config import (
     CLIP_MAX_DURATION,
     CLIP_MIN_DURATION,
     CLEANUP_TEMP_FILES,
+    TEMP_PENDING_RETENTION_DAYS,
+    TEMP_LEGACY_MAX_AGE_HOURS,
     MANUAL_CLIPS,
     PODCAST_URL,
     QUEUE_MODE,
@@ -62,7 +67,11 @@ from uploader import upload_videos as upload_youtube_videos
 from tiktok_uploader import upload_videos as upload_tiktok_videos
 from instagram_uploader import upload_videos as upload_instagram_videos
 from facebook_uploader import upload_videos as upload_facebook_videos
-from utils import filter_unused_videos, filter_duplicate_clips, record_clips
+from utils import filter_unused_videos, filter_duplicate_clips
+from runtime import AlreadyRunningError, RunLock, TempWorkspace, remove_temp_path
+from publication_store import PublicationStore
+from delivery_queue import dispatch_pending
+from repair_media import repair_delivery
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,7 +138,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Mantem os arquivos temporarios ao final da execucao",
     )
-    return parser.parse_args()
+    queue_actions = parser.add_mutually_exclusive_group()
+    queue_actions.add_argument("--queue-status", action="store_true", help="Exibe entregas e estados, sem publicar")
+    queue_actions.add_argument("--retry-pending", action="store_true", help="Processa somente entregas pendentes seguras")
+    queue_actions.add_argument("--resolve-delivery", type=int, help="ID de uma entrega incerta revisada manualmente")
+    queue_actions.add_argument("--repair-delivery", type=int, help="Refaz o clipe de uma entrega ainda nao enviada")
+    parser.add_argument("--resolution", choices=["published", "not-published"])
+    parser.add_argument("--resolution-note", default="")
+    parser.add_argument("--post-url", default=None)
+    args = parser.parse_args()
+    if args.resolve_delivery is not None and (not args.resolution or not args.resolution_note.strip()):
+        parser.error("--resolve-delivery exige --resolution e --resolution-note")
+    if args.resolve_delivery is None and (args.resolution or args.resolution_note or args.post_url):
+        parser.error("Opcoes de revisao exigem --resolve-delivery")
+    if args.input_video and (args.queue_status or args.retry_pending or args.resolve_delivery is not None or args.repair_delivery is not None):
+        parser.error("Acoes da fila nao podem ser combinadas com --input-video")
+    if args.dry_run and (args.retry_pending or args.resolve_delivery is not None or args.repair_delivery is not None):
+        parser.error("--dry-run nao pode reenviar ou resolver entregas")
+    return args
 
 
 def _normalize_local_title(video_path: Path) -> str:
@@ -180,16 +206,7 @@ def _build_local_upload_queue(args: argparse.Namespace) -> tuple[list[dict[str, 
     return [payload], [], local_video
 
 
-def cleanup_paths(paths: list[str | Path]) -> None:
-    for item in paths:
-        path = Path(item)
-        if path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-        elif path.exists():
-            path.unlink()
-
-
-def run_with_retries(label: str, operation):
+def run_with_retries(label: str, operation, should_retry=None):
     attempts = max(1, int(RETRY_ATTEMPTS))
     delay_seconds = max(0.0, float(RETRY_DELAY_SECONDS))
     last_error: Exception | None = None
@@ -199,6 +216,8 @@ def run_with_retries(label: str, operation):
             return operation()
         except Exception as exc:
             last_error = exc
+            if should_retry is not None and not should_retry(exc):
+                raise
             if attempt >= attempts:
                 break
             print(
@@ -422,6 +441,22 @@ def process_source_url(
     clip_count: int,
     schedule_map: dict[str, list[dict[str, object]]],
     source_index: int,
+    workspace: TempWorkspace,
+) -> tuple[list[dict[str, object]], list[Path]]:
+    try:
+        return _process_source_url(source_url, args, clip_count, schedule_map, source_index, workspace)
+    finally:
+        # Also runs after exhausted download retries, before trying another source.
+        workspace.cleanup_source(source_index)
+
+
+def _process_source_url(
+    source_url: str,
+    args: argparse.Namespace,
+    clip_count: int,
+    schedule_map: dict[str, list[dict[str, object]]],
+    source_index: int,
+    workspace: TempWorkspace,
 ) -> tuple[list[dict[str, object]], list[Path]]:
     print(f"\nProcessando fonte autorizada: {source_url}")
 
@@ -467,12 +502,16 @@ def process_source_url(
                     _url,
                     languages=preferred_languages,
                 ),
+                should_retry=lambda exc: "429" not in str(exc),
             )
             print(f"Legenda obtida com {len(segments)} segmentos.")
             break
         except RuntimeError as exc:
             transcript_error = exc
             print(f"Legenda do YouTube indisponivel para {selected_video_url}: {exc}")
+            if "429" in str(exc):
+                print("Limite de legendas atingido; usando o fallback local sem novas consultas de legenda.")
+                break
 
     use_manual_clips = args.manual or (MANUAL_CLIPS and not AUTO_SELECT_CLIPS)
     if use_manual_clips:
@@ -485,10 +524,10 @@ def process_source_url(
                     "Falha ao obter a legenda do YouTube e o fallback Whisper esta desativado."
                 ) from transcript_error
 
-            print("Baixando video para fallback com Whisper...")
+            print("Baixando audio para fallback com Whisper...")
             video_path = run_with_retries(
                 f"Download do video {selected_video_url}",
-                lambda: download_video(selected_video_url, TEMP_VIDEOS_DIR),
+                lambda: download_video(selected_video_url, workspace.videos / f"source_{source_index:02d}", audio_only=True),
             )
             print(f"Video salvo em {video_path}")
             print("Transcrevendo video no modo de baixo consumo...")
@@ -518,9 +557,10 @@ def process_source_url(
     video_id = extract_video_id(selected_video_url)
     clips = filter_duplicate_clips(clips, video_id)
 
+    attempt_id = uuid4().hex[:12]
     for index, clip in enumerate(clips, start=1):
-        raw_clip_path = TEMP_VIDEOS_DIR / f"raw_clip_{source_index:02d}_{index:02d}.mp4"
-        clip_path = TEMP_CLIPS_DIR / f"clip_{source_index:02d}_{index:02d}.mp4"
+        raw_clip_path = workspace.videos / f"source_{source_index:02d}" / f"raw_clip_{index:02d}.mp4"
+        clip_path = workspace.clips / f"clip_{source_index:02d}_{index:02d}_{attempt_id}.mp4"
         
         print(f"Baixando seção parcial via Web do clipe {index}/{len(clips)}...")
         run_with_retries(
@@ -542,6 +582,18 @@ def process_source_url(
         description = str(clip.get("description", title))
         hashtags = [str(tag) for tag in clip.get("hashtags", [])]
 
+        payload = {
+            "video_path": clip_path,
+            "title": title,
+            "description": description,
+            "tags": hashtags,
+            "source_url": selected_video_url,
+            "video_id": video_id,
+            "start": clip.get("start", 0),
+            "end": clip.get("end", 0),
+        }
+        workspace.register_clip(payload)
+
         if args.dry_run:
             print(f"[DRY RUN] Clipe pronto: {clip_path}")
             print(f"[DRY RUN] Titulo: {title}")
@@ -550,265 +602,152 @@ def process_source_url(
             print(f"[DRY RUN] Descricao: {description_preview}")
             continue
 
-        upload_queue.append(
-            {
-                "video_path": clip_path,
-                "title": title,
-                "description": description,
-                "tags": hashtags,
-                "source_url": selected_video_url,
-                "video_id": video_id,
-                "start": clip.get("start", 0),
-                "end": clip.get("end", 0),
-            }
-        )
+        upload_queue.append(payload)
 
     return upload_queue, generated_files
 
 
+def enabled_uploaders():
+    uploaders = {}
+    if YOUTUBE_UPLOAD_ENABLED:
+        def youtube(videos, **callbacks):
+            return upload_youtube_videos(videos, privacy_status=YOUTUBE_PRIVACY_STATUS,
+                                         category_id=YOUTUBE_CATEGORY_ID, **callbacks)
+        uploaders["youtube"] = youtube
+    if TIKTOK_UPLOAD_ENABLED:
+        uploaders["tiktok"] = upload_tiktok_videos
+    if INSTAGRAM_UPLOAD_ENABLED:
+        uploaders["instagram"] = upload_instagram_videos
+    if FACEBOOK_UPLOAD_ENABLED:
+        uploaders["facebook"] = upload_facebook_videos
+    return uploaders
+
+
+def show_queue(store):
+    rows = store.list_deliveries()
+    if not rows:
+        print("Fila vazia.")
+    for row in rows:
+        print(f"{row['id']} | {row['platform']} | {row['state']} | {row['payload']['title']}")
+        if row['error']:
+            print(f"  {row['error']}")
+        if row['receipt']:
+            print(f"  Comprovante: {row['receipt']}")
+
+
+def cleanup_confirmed(store, workspace):
+    if not workspace.cleanup:
+        return
+    completed = store.completed_clip_ids()
+    seen = set()
+    for row in store.list_deliveries():
+        if not row['owned'] or row['clip_id'] not in completed or row['clip_id'] in seen:
+            continue
+        seen.add(row['clip_id'])
+        path = Path(row['payload']['video_path'])
+        if not path.exists():
+            continue
+        marker = path.parent / '.run.json'
+        try:
+            if marker.exists() and json.loads(marker.read_text(encoding='utf-8')).get('keep'):
+                continue
+        except (OSError, ValueError):
+            continue
+        remove_temp_path(path, workspace.clips_root)
+    current = workspace.manifest['clips']
+    if current and all(clip.get('clip_id') in completed for clip in current):
+        workspace.mark_uploads_complete()
+
+
 def main() -> None:
     args = parse_args()
+    try:
+        with RunLock(BASE_DIR / ".podcast_automation.lock"):
+            with PublicationStore(PUBLICATION_DB, HISTORY_FILE) as store:
+                store.recover()
+                if args.queue_status:
+                    show_queue(store)
+                    return
+                if args.resolve_delivery is not None:
+                    store.resolve(args.resolve_delivery, args.resolution, args.resolution_note, args.post_url)
+                    print("Revisao registrada. Nenhum envio foi realizado.")
+                    return
+                with TempWorkspace(
+                    TEMP_VIDEOS_DIR, TEMP_CLIPS_DIR,
+                    cleanup=CLEANUP_TEMP_FILES and not args.no_cleanup,
+                    retention_days=TEMP_PENDING_RETENTION_DAYS,
+                    legacy_hours=TEMP_LEGACY_MAX_AGE_HOURS,
+                    protected_path=Path(args.input_video).expanduser() if args.input_video else None,
+                    protected_paths=store.protected_paths(),
+                ) as workspace:
+                    if args.repair_delivery is not None:
+                        repair_delivery(store, args.repair_delivery, workspace)
+                        return
+                    run_pipeline(args, workspace, store)
+    except AlreadyRunningError as exc:
+        print(exc)
 
-    if args.input_video:
-        upload_queue, generated_files, local_video = _build_local_upload_queue(args)
 
-        if args.dry_run:
-            item = upload_queue[0]
-            print("Modo de video local em dry-run; nenhum upload sera feito.")
-            print(f"Video: {item['video_path']}")
-            print(f"Titulo: {item['title']}")
-            print(f"Descricao: {item['description']}")
-            print(f"Tags: {' '.join(str(tag) for tag in item['tags'])}")
-            if CLEANUP_TEMP_FILES and not args.no_cleanup:
-                print("Limpando arquivos temporarios...")
-                cleanup_paths(generated_files + [TEMP_VIDEOS_DIR, TEMP_CLIPS_DIR])
-            return
-
-        platform_errors: list[str] = []
-        youtube_uploaded_refs: list[str] = []
-        tiktok_uploaded_refs: list[str] = []
-        instagram_uploaded_refs: list[str] = []
-        facebook_uploaded_refs: list[str] = []
-
-        try:
-            if TIKTOK_UPLOAD_ENABLED:
-                print("Enviando video local para o TikTok...")
-                try:
-                    tiktok_uploaded_refs = upload_tiktok_videos(upload_queue)
-                except Exception as exc:
-                    platform_errors.append(f"TikTok: {exc}")
-                    print(f"Falha ao enviar para o TikTok: {exc}")
-            else:
-                print("Upload para o TikTok desativado em config.py.")
-
-            if YOUTUBE_UPLOAD_ENABLED:
-                print("Enviando video local para o YouTube...")
-                try:
-                    youtube_uploaded_refs = upload_youtube_videos(
-                        upload_queue,
-                        privacy_status=YOUTUBE_PRIVACY_STATUS,
-                        category_id=YOUTUBE_CATEGORY_ID,
-                    )
-                except Exception as exc:
-                    platform_errors.append(f"YouTube: {exc}")
-                    print(f"Falha ao enviar para o YouTube: {exc}")
-            else:
-                print("Upload para o YouTube desativado em config.py.")
-
-            if INSTAGRAM_UPLOAD_ENABLED:
-                print("Enviando video local para o Instagram...")
-                try:
-                    instagram_uploaded_refs = upload_instagram_videos(upload_queue)
-                except Exception as exc:
-                    platform_errors.append(f"Instagram: {exc}")
-                    print(f"Falha ao enviar para o Instagram: {exc}")
-            else:
-                print("Upload para o Instagram desativado em config.py.")
-
-            if FACEBOOK_UPLOAD_ENABLED:
-                print("Enviando video local para o Facebook...")
-                try:
-                    facebook_uploaded_refs = upload_facebook_videos(upload_queue)
-                except Exception as exc:
-                    platform_errors.append(f"Facebook: {exc}")
-                    print(f"Falha ao enviar para o Facebook: {exc}")
-            else:
-                print("Upload para o Facebook desativado em config.py.")
-
-        finally:
-            if CLEANUP_TEMP_FILES and not args.no_cleanup:
-                print("Limpando arquivos temporarios...")
-                cleanup_paths(generated_files + [TEMP_VIDEOS_DIR, TEMP_CLIPS_DIR])
-
-        if youtube_uploaded_refs or tiktok_uploaded_refs or instagram_uploaded_refs or facebook_uploaded_refs:
-            platforms_posted = []
-            if youtube_uploaded_refs:
-                platforms_posted.append("youtube")
-                print(f"Upload concluido no YouTube para {len(youtube_uploaded_refs)} video(s).")
-            if tiktok_uploaded_refs:
-                platforms_posted.append("tiktok")
-                print(f"Upload concluido no TikTok para {len(tiktok_uploaded_refs)} video(s).")
-            if instagram_uploaded_refs:
-                platforms_posted.append("instagram")
-                print(f"Upload concluido no Instagram para {len(instagram_uploaded_refs)} video(s).")
-            if facebook_uploaded_refs:
-                platforms_posted.append("facebook")
-                print(f"Upload concluido no Facebook para {len(facebook_uploaded_refs)} video(s).")
-            record_clips(str(upload_queue[0]["video_id"]), str(local_video), upload_queue, platforms_posted)
-        else:
-            print("Execucao concluida sem upload.")
-
-        if platform_errors:
-            print(f"Fila concluida com {len(platform_errors)} erro(s) de plataforma.")
-
-        if not (youtube_uploaded_refs or tiktok_uploaded_refs or instagram_uploaded_refs or facebook_uploaded_refs):
-            raise RuntimeError("Nao foi possivel publicar o video local em nenhuma plataforma.")
-
+def run_pipeline(args: argparse.Namespace, workspace: TempWorkspace, store: PublicationStore) -> None:
+    uploaders = enabled_uploaders()
+    if not args.dry_run and not uploaders:
+        print("Nenhuma plataforma habilitada; nenhum novo clipe sera gerado.")
         return
 
+    def deliver():
+        counts = dispatch_pending(store, uploaders)
+        cleanup_confirmed(store, workspace)
+        print(f"Entregas: {counts['confirmed']} confirmadas, {counts['failed']} falhas, {counts['uncertain']} incertas.")
+        if counts['failed'] or counts['uncertain']:
+            raise RuntimeError("Fila preservada: ha entregas com falha ou publicacao incerta.")
+
+    backlog = [row for row in store.list_deliveries()
+               if row['platform'] in uploaders and row['state'] in {'pending', 'failed', 'uncertain'}]
+    if not args.dry_run and not args.input_video and (backlog or getattr(args, 'retry_pending', False)):
+        deliver()
+        if any(row['state'] == 'uncertain' for row in backlog):
+            print("Ha entregas incertas. Use --queue-status e revise a plataforma antes de liberar reenvio.")
+        return
+
+    if args.input_video:
+        queue, _, original = _build_local_upload_queue(args)
+        if args.dry_run:
+            print(f"[DRY RUN] Video local preservado, sem upload: {original}")
+            return
+        store.enqueue(queue[0], uploaders, owned=False)
+        deliver()
+        return
+
+    if not args.dry_run:
+        workspace.on_clip_ready = lambda payload: store.enqueue(
+            payload, uploaders, owned=True, retention_days=TEMP_PENDING_RETENTION_DAYS,
+        )
     schedule_map = load_source_schedules()
     queue_mode = bool(args.queue)
     source_urls = resolve_source_urls(args, queue_mode=queue_mode, schedule_map=schedule_map)
     if not source_urls:
-        raise ValueError(
-            "Defina uma URL valida do podcast usando --url, --source-url ou em config.py."
-        )
-
+        raise ValueError("Defina uma fonte autorizada valida.")
     if args.manual and not MANUAL_CLIPS:
-        raise RuntimeError("Modo manual ativado, mas MANUAL_CLIPS esta vazio em config.py.")
-
+        raise RuntimeError("Modo manual ativado, mas MANUAL_CLIPS esta vazio.")
     clip_count = int(args.clip_count)
     if clip_count < 1:
         raise ValueError("A quantidade de shorts precisa ser pelo menos 1.")
-
-    upload_queue: list[dict[str, object]] = []
-    generated_files: list[Path] = []
-    source_errors: list[str] = []
-    platform_errors: list[str] = []
-    youtube_uploaded_refs: list[str] = []
-    tiktok_uploaded_refs: list[str] = []
-    instagram_uploaded_refs: list[str] = []
-    facebook_uploaded_refs: list[str] = []
-    last_source_error: Exception | None = None
-
-    if queue_mode:
-        print(f"Modo fila ativado: {len(source_urls)} fontes permitidas na fila.")
-
-    try:
-        for source_index, source_url in enumerate(source_urls, start=1):
-            print(f"\nFonte {source_index}/{len(source_urls)}")
-            try:
-                source_upload_queue, source_files = run_with_retries(
-                    f"Processamento da fonte {source_url}",
-                    lambda _url=source_url, _idx=source_index: process_source_url(
-                        _url,
-                        args,
-                        clip_count,
-                        schedule_map,
-                        _idx,
-                    ),
-                )
-                generated_files.extend(source_files)
-                upload_queue.extend(source_upload_queue)
-                if source_upload_queue and not queue_mode:
-                    break
-            except Exception as exc:
-                last_source_error = exc
-                error_message = f"{source_url}: {exc}"
-                source_errors.append(error_message)
-                context_label = " da fila" if queue_mode else ""
-                print(f"Falha na fonte{context_label}, seguindo adiante: {exc}")
-                continue
-
-        if not upload_queue and source_errors:
-            raise RuntimeError("Nao foi possivel gerar clipes a partir de nenhuma fonte autorizada.") from last_source_error
-
-        if upload_queue:
-            if TIKTOK_UPLOAD_ENABLED:
-                print(f"Enviando {len(upload_queue)} shorts em lote para o TikTok...")
-                try:
-                    tiktok_uploaded_refs = upload_tiktok_videos(upload_queue)
-                except Exception as exc:
-                    platform_errors.append(f"TikTok: {exc}")
-                    print(f"Falha ao enviar para o TikTok: {exc}")
-            else:
-                print("Upload para o TikTok desativado em config.py.")
-
-            if YOUTUBE_UPLOAD_ENABLED:
-                print(f"Enviando {len(upload_queue)} shorts em lote para o YouTube...")
-                try:
-                    youtube_uploaded_refs = upload_youtube_videos(
-                        upload_queue,
-                        privacy_status=YOUTUBE_PRIVACY_STATUS,
-                        category_id=YOUTUBE_CATEGORY_ID,
-                    )
-                except Exception as exc:
-                    platform_errors.append(f"YouTube: {exc}")
-                    print(f"Falha ao enviar para o YouTube: {exc}")
-            else:
-                print("Upload para o YouTube desativado em config.py.")
-
-            if INSTAGRAM_UPLOAD_ENABLED:
-                print(f"Enviando {len(upload_queue)} shorts em lote para o Instagram...")
-                try:
-                    instagram_uploaded_refs = upload_instagram_videos(upload_queue)
-                except Exception as exc:
-                    platform_errors.append(f"Instagram: {exc}")
-                    print(f"Falha ao enviar para o Instagram: {exc}")
-            else:
-                print("Upload para o Instagram desativado em config.py.")
-
-            if FACEBOOK_UPLOAD_ENABLED:
-                print(f"Enviando {len(upload_queue)} shorts em lote para o Facebook...")
-                try:
-                    facebook_uploaded_refs = upload_facebook_videos(upload_queue)
-                except Exception as exc:
-                    platform_errors.append(f"Facebook: {exc}")
-                    print(f"Falha ao enviar para o Facebook: {exc}")
-            else:
-                print("Upload para o Facebook desativado em config.py.")
-
-    finally:
-        if CLEANUP_TEMP_FILES and not args.no_cleanup:
-            print("Limpando arquivos temporarios...")
-            cleanup_paths(generated_files + [TEMP_VIDEOS_DIR, TEMP_CLIPS_DIR])
-
-    if youtube_uploaded_refs or tiktok_uploaded_refs or instagram_uploaded_refs or facebook_uploaded_refs:
-        # Registra clipes no historico para evitar duplicatas futuras
-        platforms_posted = []
-        if youtube_uploaded_refs:
-            platforms_posted.append("youtube")
-            print(f"Upload concluido no YouTube para {len(youtube_uploaded_refs)} clipes.")
-        if tiktok_uploaded_refs:
-            platforms_posted.append("tiktok")
-            print(f"Upload concluido no TikTok para {len(tiktok_uploaded_refs)} clipes.")
-        if instagram_uploaded_refs:
-            platforms_posted.append("instagram")
-            print(f"Upload concluido no Instagram para {len(instagram_uploaded_refs)} clipes.")
-        if facebook_uploaded_refs:
-            platforms_posted.append("facebook")
-            print(f"Upload concluido no Facebook para {len(facebook_uploaded_refs)} clipes.")
-        
-        # Agrupa clipes por video_id e registra todos
-        recorded_videos: set[str] = set()
-        for item in upload_queue:
-            vid = str(item.get("video_id", ""))
-            source = str(item.get("source_url", ""))
-            if vid and vid not in recorded_videos:
-                video_clips = [i for i in upload_queue if str(i.get("video_id", "")) == vid]
-                record_clips(vid, source, video_clips, platforms_posted)
-                recorded_videos.add(vid)
-    else:
-        print("Execucao concluida sem upload.")
-
-    if source_errors:
-        print(f"Fila concluida com {len(source_errors)} erro(s) de fonte.")
-
-    if platform_errors:
-        print(f"Fila concluida com {len(platform_errors)} erro(s) de plataforma.")
-
-    if upload_queue and not (youtube_uploaded_refs or tiktok_uploaded_refs or instagram_uploaded_refs or facebook_uploaded_refs):
-        raise RuntimeError("Nao foi possivel publicar os clipes em nenhuma plataforma.")
+    errors = []
+    for index, source in enumerate(source_urls, 1):
+        try:
+            queue, _ = run_with_retries(
+                f"Processamento da fonte {source}",
+                lambda: process_source_url(source, args, clip_count, schedule_map, index, workspace),
+            )
+            if not queue_mode and (queue or (args.dry_run and workspace.manifest['clips'])):
+                break
+        except Exception as exc:
+            errors.append(str(exc))
+            print(f"Falha na fonte {source}: {exc}")
+    if not args.dry_run:
+        deliver()
+    if errors and not workspace.manifest['clips']:
+        raise RuntimeError("Nao foi possivel gerar cortes: " + '; '.join(errors))
 
 
 if __name__ == "__main__":

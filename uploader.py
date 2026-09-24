@@ -3,6 +3,7 @@ from __future__ import annotations
 import time as time_module
 from pathlib import Path
 from typing import Sequence
+from publication import PublicationAttempt, PublicationReceipt, perform_upload
 
 from config import BASE_DIR, RETRY_ATTEMPTS, RETRY_DELAY_SECONDS
 
@@ -10,36 +11,18 @@ YOUTUBE_STUDIO_URL = "https://studio.youtube.com/"
 USER_DATA_DIR = BASE_DIR / "browser_data"
 
 
-def upload_videos(
-    videos: Sequence[dict[str, object]],
-    privacy_status: str = "public",
-    category_id: str = "22",
-) -> list[str]:
-    """
-    Faz upload em lote para o YouTube Studio usando uma única sessão persistente.
-    A primeira execução exigira login manual.
-    """
-    try:
-        from playwright.sync_api import TimeoutError, sync_playwright
-    except ImportError:
-        raise ImportError(
-            "O pacote 'playwright' nao esta instalado. Execute: pip install playwright && playwright install chromium"
-        )
-
+def upload_videos(videos: Sequence[dict[str, object]], privacy_status: str = "public", category_id: str = "22",
+                  *, on_submitting=None, on_confirmed=None) -> list[PublicationReceipt]:
+    """Return explicit receipts. Never retry a potentially submitted publication."""
+    from playwright.sync_api import TimeoutError, sync_playwright
     if not videos:
         return []
-
-    print("Iniciando automacao em lote do YouTube Studio...")
-    uploaded_refs: list[str] = []
-    failed_refs: list[str] = []
-    attempts = max(1, int(RETRY_ATTEMPTS))
-    delay_seconds = max(0.0, float(RETRY_DELAY_SECONDS))
-
+    receipts = []
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(USER_DATA_DIR),
+            channel="chrome",
             headless=False,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
             locale="pt-BR",
             args=[
                 "--disable-blink-features=AutomationControlled",
@@ -55,91 +38,25 @@ def upload_videos(
 
         try:
             page = context.new_page()
-            try:
+            for video in videos:
+                video_path = Path(str(video["video_path"])).resolve()
+                if not video_path.is_file():
+                    raise FileNotFoundError(f"Video nao encontrado em {video_path}")
+                title = str(video["title"])
+                description = str(video.get("description", title))
+                tags = [str(tag) for tag in video.get("tags", [])]
                 _open_studio_home(page)
                 _ensure_logged_in(page, TimeoutError)
                 _dismiss_welcome_modal(page)
-            except Exception as e:
-                DEBUG_SCREENSHOTS_DIR = BASE_DIR / "debug_screenshots"
-                DEBUG_SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-                screenshot_path = DEBUG_SCREENSHOTS_DIR / "youtube_init_error.png"
-                try:
-                    page.screenshot(path=str(screenshot_path))
-                    print(f"📸 Screenshot de depuração do YouTube salvo em: {screenshot_path}")
-                except Exception as sc_err:
-                    print(f"Não foi possível salvar o screenshot de erro do YouTube: {sc_err}")
-                print(f"URL atual do YouTube no momento da falha: {page.url}")
-                raise e
-
-            for index, video in enumerate(videos, start=1):
-                video_path = Path(str(video["video_path"])).resolve()
-                if not video_path.exists():
-                    raise FileNotFoundError(f"Video nao encontrado em {video_path}")
-
-                title = str(video["title"])
-                description = str(video["description"])
-                tags = [str(tag).strip() for tag in video.get("tags", []) if str(tag).strip()]
-
-                print(f"Enviando Short {index}/{len(videos)}: {title}...")
-                video_uploaded = False
-                last_error: Exception | None = None
-
-                for attempt in range(1, attempts + 1):
-                    try:
-                        _upload_single_video(
-                            page=page,
-                            video_file=video_path,
-                            title=title,
-                            description=description,
-                            tags=tags,
-                            privacy_status=privacy_status,
-                            category_id=category_id,
-                        )
-                        uploaded_refs.append(title)
-                        video_uploaded = True
-                        break
-                    except Exception as exc:
-                        last_error = exc
-                        # Salvar screenshot do erro no upload
-                        DEBUG_SCREENSHOTS_DIR = BASE_DIR / "debug_screenshots"
-                        DEBUG_SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-                        sc_path = DEBUG_SCREENSHOTS_DIR / f"youtube_upload_error_attempt_{attempt}.png"
-                        try:
-                            page.screenshot(path=str(sc_path))
-                            print(f"📸 Screenshot de depuracao do erro no YouTube salvo em: {sc_path}")
-                        except Exception as sc_err:
-                            print(f"Nao foi possivel salvar o screenshot de erro do YouTube: {sc_err}")
-                        
-                        if attempt >= attempts:
-                            break
-                        print(
-                            f"Falha ao enviar '{title}' na tentativa {attempt}/{attempts}: {exc}"
-                        )
-                        if delay_seconds:
-                            print(f"Tentando novamente em {delay_seconds:.0f} segundos...")
-                            time_module.sleep(delay_seconds)
-                        try:
-                            _open_studio_home(page)
-                            _dismiss_welcome_modal(page)
-                        except Exception:
-                            pass
-
-                if not video_uploaded:
-                    failed_refs.append(title)
-                    print(f"Nao foi possivel enviar '{title}' apos {attempts} tentativa(s).")
-
-                if index < len(videos):
-                    print("Preparando o proximo Short...")
-                    _open_studio_home(page)
-                    _dismiss_welcome_modal(page)
+                publication = PublicationAttempt(
+                    "youtube",
+                    (lambda: on_submitting(video)) if on_submitting else None,
+                    (lambda receipt: on_confirmed(video, receipt)) if on_confirmed else None,
+                )
+                receipts.append(perform_upload(lambda: _upload_single_video(page, video_path, title, description, tags, privacy_status, category_id, publication), publication))
         finally:
-            print("Fechando navegador automaticamente...")
             context.close()
-
-    if failed_refs:
-        print(f"{len(failed_refs)} Short(s) falharam mesmo apos reprocessamento automatico.")
-
-    return uploaded_refs
+    return receipts
 
 
 def upload_video(
@@ -149,7 +66,7 @@ def upload_video(
     tags: Sequence[str],
     privacy_status: str = "public",
     category_id: str = "22",
-) -> str:
+) -> PublicationReceipt:
     uploaded_refs = upload_videos(
         [
             {
@@ -162,7 +79,7 @@ def upload_video(
         privacy_status=privacy_status,
         category_id=category_id,
     )
-    return uploaded_refs[0] if uploaded_refs else "UPLOAD_AUTOMATICO_PLAYWRIGHT"
+    return uploaded_refs[0]
 
 
 def _open_studio_home(page) -> None:
@@ -246,6 +163,7 @@ def _upload_single_video(
     tags: Sequence[str],
     privacy_status: str,
     category_id: str,
+    publication: PublicationAttempt,
 ) -> None:
     print("Iniciando upload...")
     try:
@@ -367,23 +285,6 @@ def _upload_single_video(
     else:
         page.locator("tp-yt-paper-radio-button[name='PRIVATE']").click(timeout=10000, force=True)
 
-    print("Publicando video...")
+    publication.before_submit(page)
     page.locator("ytcp-button#done-button").dispatch_event("click")
-
-    print("Aguardando confirmacao do YouTube...")
-    title_marker = clean_title[:35].strip() or clean_title
-    try:
-        page.wait_for_function(
-            """(marker) => (document.body ? document.body.innerText : '').includes(marker)""",
-            title_marker,
-            timeout=60000,
-        )
-    except Exception:
-        pass
-
-    page.wait_for_function(
-        r"""() => !/Envio em\s*\d+%/i.test(document.body ? document.body.innerText : '')""",
-        timeout=1800000,
-    )
-    print("Upload concluido com sucesso via automacao!")
-    page.wait_for_timeout(2000)
+    publication.confirm(page)

@@ -9,10 +9,11 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
 batPath   = fso.BuildPath(scriptDir, "run_bot.bat")
 
-Dim WshShell
+Dim WshShell, exitCode
 Set WshShell = CreateObject("WScript.Shell")
 WshShell.CurrentDirectory = scriptDir
-WshShell.Run """" & batPath & """", 0, False
+exitCode = WshShell.Run("""" & batPath & """", 0, True)
 
 Set WshShell = Nothing
 Set fso = Nothing
+WScript.Quit exitCode

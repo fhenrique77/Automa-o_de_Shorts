@@ -26,7 +26,7 @@ AUTO_SELECT_CLIPS = True
 # --- Google Gemini AI Curation ---
 USE_AI_CURATION = True
 import os
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 CLIP_COUNT = 1
 CLIP_MIN_DURATION = 15.0
@@ -47,7 +47,7 @@ YOUTUBE_CATEGORY_ID = "22"
 YOUTUBE_PRIVACY_STATUS = "public"
 YOUTUBE_UPLOAD_ENABLED = True
 
-TIKTOK_UPLOAD_ENABLED = False  # Desativado temporariamente — conta nova aquecendo
+TIKTOK_UPLOAD_ENABLED = True
 TIKTOK_UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload?from=webapp&lang=pt-BR"
 TIKTOK_LOGIN_URL = "https://www.tiktok.com/login/phone-or-email/email?lang=pt-BR"
 TIKTOK_USER_DATA_DIR = BASE_DIR / "browser_data_tiktok"
@@ -94,9 +94,12 @@ DESCRIPTION_MAX_CHARS = 800
 CLIP_TITLE_PREFIX = "Trecho que vale ouro"
 
 CLEANUP_TEMP_FILES = True
+TEMP_PENDING_RETENTION_DAYS = 7
+TEMP_LEGACY_MAX_AGE_HOURS = 24
 
 # Detecção de duplicatas
 HISTORY_FILE = BASE_DIR / "historico.json"
+PUBLICATION_DB = BASE_DIR / "publicacoes.sqlite3"
 HISTORY_VIDEO_DAYS = 30     # Nao reusar o mesmo video por N dias
 HISTORY_CLIP_DAYS = 90      # Nao reusar o mesmo trecho por N dias
 VERTICAL_OUTPUT = True

@@ -3,6 +3,7 @@ from __future__ import annotations
 import time as time_module
 from pathlib import Path
 from typing import Sequence
+from publication import PublicationAttempt, PublicationReceipt, perform_upload
 
 from utils import build_social_caption
 from config import (
@@ -19,32 +20,17 @@ from config import (
 DEBUG_SCREENSHOTS_DIR = BASE_DIR / "debug_screenshots"
 
 
-def upload_videos(
-    videos: Sequence[dict[str, object]],
-    caption_limit: int = INSTAGRAM_CAPTION_MAX_CHARS,
-) -> list[str]:
-    """
-    Faz upload em lote para o Instagram Reels.
-    """
-    try:
-        from playwright.sync_api import TimeoutError, sync_playwright
-    except ImportError:
-        raise ImportError(
-            "O pacote 'playwright' não está instalado."
-        )
-
+def upload_videos(videos: Sequence[dict[str, object]], caption_limit: int = INSTAGRAM_CAPTION_MAX_CHARS,
+                  *, on_submitting=None, on_confirmed=None) -> list[PublicationReceipt]:
+    """Return explicit receipts. Never retry a potentially submitted publication."""
+    from playwright.sync_api import TimeoutError, sync_playwright
     if not videos:
         return []
-
-    print("Iniciando automação em lote do Instagram...")
-    uploaded_refs: list[str] = []
-    failed_refs: list[str] = []
-    attempts = max(1, int(RETRY_ATTEMPTS))
-    delay_seconds = max(0.0, float(RETRY_DELAY_SECONDS))
-
+    receipts = []
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(INSTAGRAM_USER_DATA_DIR),
+            channel="chrome",
             headless=HEADLESS_MODE,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             args=[
@@ -62,52 +48,25 @@ def upload_videos(
 
         try:
             page = context.new_page()
-            
-            for index, video in enumerate(videos, start=1):
+            for video in videos:
                 video_path = Path(str(video["video_path"])).resolve()
-                if not video_path.exists():
-                    raise FileNotFoundError(f"Vídeo não encontrado em {video_path}")
-
+                if not video_path.is_file():
+                    raise FileNotFoundError(f"Video nao encontrado em {video_path}")
                 title = str(video["title"])
                 description = str(video.get("description", title))
-                caption = build_social_caption(title, description, limit=caption_limit)
-
-                print(f"Enviando Reel {index}/{len(videos)} para o Instagram: {title}...")
-                video_uploaded = False
-
-                for attempt in range(1, attempts + 1):
-                    try:
-                        _open_upload_home(page)
-                        _ensure_logged_in(page, TimeoutError)
-                        
-                        _upload_single_video(
-                            page=page,
-                            video_file=video_path,
-                            caption=caption,
-                        )
-                        uploaded_refs.append(title)
-                        video_uploaded = True
-                        break
-                    except Exception as exc:
-                        _save_debug_screenshot(page, f"instagram_attempt_{attempt}")
-                        if attempt >= attempts:
-                            print(f"Falha final ao enviar '{title}' ao Instagram: {exc}")
-                            break
-                        print(
-                            f"Falha ao enviar '{title}' no Instagram na tentativa {attempt}/{attempts}: {exc}"
-                        )
-                        if delay_seconds:
-                            print(f"Tentando novamente em {delay_seconds:.0f} segundos...")
-                            time_module.sleep(delay_seconds)
-
-                if not video_uploaded:
-                    failed_refs.append(title)
-
+                tags = [str(tag) for tag in video.get("tags", [])]
+                _open_upload_home(page)
+                _ensure_logged_in(page, TimeoutError)
+                caption = build_social_caption(title, description, limit=caption_limit, tags=tags)
+                publication = PublicationAttempt(
+                    "instagram",
+                    (lambda: on_submitting(video)) if on_submitting else None,
+                    (lambda receipt: on_confirmed(video, receipt)) if on_confirmed else None,
+                )
+                receipts.append(perform_upload(lambda: _upload_single_video(page, video_path, caption, publication), publication))
         finally:
-            print("Fechando navegador Instagram automaticamente...")
             context.close()
-
-    return uploaded_refs
+    return receipts
 
 def _open_upload_home(page) -> None:
     page.goto(INSTAGRAM_URL)
@@ -183,54 +142,145 @@ def _ensure_logged_in(page, timeout_error) -> None:
     )
     print("Login do Instagram concluído com sucesso!")
 
-def _upload_single_video(page, video_file: Path, caption: str) -> None:
+def _upload_single_video(page, video_file: Path, caption: str, publication: PublicationAttempt) -> None:
     print("Iniciando fluxo de upload no Instagram...")
 
     # Fechar popups genéricos que atrapalham
     _dismiss_generic_popups(page)
 
-    # 1. Clicar em Criar
+    # 1. Clicar em Criar — múltiplas estratégias
     print("Abrindo modal de criação...")
-    create_btn = _first_visible_locator(
-        page,
-        [
-            "span:has-text('Criar')",
-            "span:has-text('Create')",
-            "svg[aria-label='Nova publicação']",
-            "svg[aria-label='New post']",
-            "[aria-label='Criar']",
-            "[aria-label='Nova publicação']",
-            "[aria-label='Create']",
-            "[aria-label='New post']",
-        ],
-        timeout_ms=30000,
-    )
-    create_btn.click(timeout=10000, force=True)
-    page.wait_for_timeout(3000)
+    modal_opened = False
 
-    # 2. Upload do arquivo via input[type=file] (método mais confiável)
+    # Helper: tenta clicar no submenu "Postar" se um dropdown apareceu
+    def _try_click_postar_dropdown():
+        """Após clicar em 'Criar', o Instagram pode abrir um dropdown
+        com opções 'Postar' e 'IA'. Precisamos clicar em 'Postar'."""
+        dropdown_texts = ['Postar', 'Publicação', 'Post', 'Create post']
+        for txt in dropdown_texts:
+            try:
+                for tag in ['span', 'a', 'div']:
+                    loc = page.locator(f"{tag}:text-is('{txt}')").first
+                    if loc.is_visible(timeout=1000):
+                        loc.click(timeout=3000)
+                        page.wait_for_timeout(2000)
+                        return True
+            except Exception:
+                continue
+        return False
+
+    # Estratégia A: Clique no link da sidebar + dropdown
+    create_selectors = [
+        "a:has-text('Criar')",
+        "a:has-text('Create')",
+        "[aria-label='Nova publicação']",
+        "[aria-label='New post']",
+        "[aria-label='Criar']",
+        "[aria-label='Create']",
+        "svg[aria-label='Nova publicação']",
+        "svg[aria-label='New post']",
+    ]
+
+    for sel in create_selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=2000):
+                # Tentar clique nativo primeiro
+                loc.click(timeout=5000)
+                page.wait_for_timeout(2000)
+
+                # Verificar se o modal abriu direto (sem dropdown)
+                if page.locator("input[type='file']").count() > 0:
+                    modal_opened = True
+                    print(f"Modal aberto diretamente via: {sel}")
+                    break
+
+                # Se não abriu, provavelmente apareceu o dropdown — clicar em "Postar"
+                if _try_click_postar_dropdown():
+                    if page.locator("input[type='file']").count() > 0:
+                        modal_opened = True
+                        print(f"Modal aberto via dropdown 'Postar' após: {sel}")
+                        break
+
+                # Último recurso: dispatch_event
+                loc.dispatch_event("click")
+                page.wait_for_timeout(2000)
+                _try_click_postar_dropdown()
+                page.wait_for_timeout(1000)
+                if page.locator("input[type='file']").count() > 0:
+                    modal_opened = True
+                    print(f"Modal aberto via dispatch_event em: {sel}")
+                    break
+        except Exception:
+            continue
+
+    # Estratégia B: JavaScript puro
+    if not modal_opened:
+        print("Tentando abrir modal via JavaScript...")
+        try:
+            page.evaluate('''() => {
+                const links = document.querySelectorAll('a, div[role="button"], span');
+                for (const el of links) {
+                    const txt = (el.textContent || '').trim();
+                    if (txt === 'Criar' || txt === 'Create') {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }''')
+            page.wait_for_timeout(2000)
+            _try_click_postar_dropdown()
+            page.wait_for_timeout(1000)
+            if page.locator("input[type='file']").count() > 0:
+                modal_opened = True
+                print("Modal aberto via JavaScript puro.")
+        except Exception:
+            pass
+
+    if not modal_opened:
+        _save_debug_screenshot(page, "instagram_modal_failed")
+        raise RuntimeError(
+            "Não foi possível abrir o modal de criação do Instagram. "
+            "O botão 'Criar' não respondeu ao clique."
+        )
+
+    # 2. Upload do arquivo via input[type=file]
     print("Injetando arquivo de vídeo...")
     file_input = page.locator("input[type='file']").first
     try:
         file_input.wait_for(state="attached", timeout=10000)
+        # Aceitar todos os tipos de arquivo (o Instagram pode restringir via accept)
+        page.evaluate('''() => {
+            const inputs = document.querySelectorAll('input[type="file"]');
+            inputs.forEach(i => i.removeAttribute("accept"));
+        }''')
         file_input.set_files(str(video_file))
         print("Arquivo injetado via input[type=file].")
     except Exception:
         print("Fallback: usando file chooser...")
-        with page.expect_file_chooser() as file_chooser_info:
-            select_btn = _first_visible_locator(
-                page,
-                [
-                    "button:has-text('Selecionar do computador')",
-                    "button:has-text('Select from computer')",
-                    "text=Selecionar do computador",
-                    "text=Select from computer",
-                ],
-                timeout_ms=10000,
+        try:
+            with page.expect_file_chooser(timeout=10000) as file_chooser_info:
+                select_btn = _first_visible_locator(
+                    page,
+                    [
+                        "button:has-text('Selecionar do computador')",
+                        "button:has-text('Select from computer')",
+                        "div[role='button']:has-text('Selecionar do computador')",
+                        "div[role='button']:has-text('Select from computer')",
+                        "text=Selecionar do computador",
+                        "text=Select from computer",
+                    ],
+                    timeout_ms=10000,
+                )
+                select_btn.click(timeout=10000, force=True)
+            file_chooser_info.value.set_files(str(video_file))
+            print("Arquivo injetado via file chooser.")
+        except Exception as exc:
+            _save_debug_screenshot(page, "instagram_file_inject_failed")
+            raise RuntimeError(
+                f"Não foi possível injetar o arquivo de vídeo no Instagram: {exc}"
             )
-            select_btn.click(timeout=10000, force=True)
-        file_chooser_info.value.set_files(str(video_file))
-        print("Arquivo injetado via file chooser.")
 
     # Aguardar o Instagram processar o vídeo (loading/spinner)
     print("Aguardando Instagram processar o vídeo...")
@@ -297,29 +347,9 @@ def _upload_single_video(page, video_file: Path, caption: str) -> None:
     _fill_instagram_caption(page, caption)
     page.wait_for_timeout(2000)
 
-    # 6. Compartilhar — múltiplas estratégias de clique
-    print("Clicando em Compartilhar...")
-    _save_debug_screenshot(page, "ig_before_share_click")
-    _click_share_button(page)
-
-    # 7. Aguardar confirmação REAL de publicação
-    print("Aguardando confirmação real do Instagram (até 120s)...")
-    confirmed = _wait_for_share_confirmation(page, timeout_ms=120000)
-
-    if confirmed:
-        print("✅ Publicação confirmada pelo Instagram!")
-    else:
-        # Capturar screenshot para diagnóstico
-        _save_debug_screenshot(page, "instagram_share_failed")
-        raise RuntimeError(
-            "Instagram não confirmou a publicação. O vídeo pode não ter sido "
-            "publicado. Verifique a conta manualmente."
-        )
-
-    # Fechar o modal de confirmação
+    _click_share_button(page, publication)
+    _wait_for_share_confirmation(page, publication)
     _close_confirmation_modal(page)
-
-    print("Upload concluído com sucesso via Instagram!")
 
 
 def _dismiss_generic_popups(page) -> None:
@@ -465,164 +495,17 @@ def _fill_instagram_caption(page, caption: str) -> None:
     print("⚠️ Não foi possível preencher a legenda — publicando sem legenda.")
 
 
-def _click_share_button(page) -> None:
-    """Clica no botão Compartilhar usando múltiplas estratégias."""
-    share_selectors = [
-        "div[role='button']:text-is('Compartilhar')",
-        "button:text-is('Compartilhar')",
-        "div[role='button']:text-is('Share')",
-        "button:text-is('Share')",
-        # Fallbacks em caso do texto exato falhar (ícones, etc)
-        "div[role='button']:has-text('Compartilhar'):not(:has-text('primeira'))",
-        "button:has-text('Compartilhar'):not(:has-text('primeira'))",
-    ]
-
-    share_btn = _first_visible_locator(page, share_selectors, timeout_ms=15000)
-
-    # Esperar o botão estar habilitado
-    try:
-        page.wait_for_timeout(2000)
-        is_disabled = share_btn.evaluate("el => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'")
-        if is_disabled:
-            print("Botão Compartilhar está desabilitado (vídeo processando ou legenda carregando). Aguardando ficar habilitado...")
-            start_wait = time_module.monotonic()
-            while time_module.monotonic() - start_wait < 30:
-                page.wait_for_timeout(2000)
-                is_disabled = share_btn.evaluate("el => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'")
-                if not is_disabled:
-                    print("Botão Compartilhar foi habilitado!")
-                    break
-            else:
-                print("Aviso: Tempo limite de espera pelo botão habilitado excedido. Tentando clicar mesmo assim.")
-    except Exception as e:
-        print(f"Erro ao verificar se o botão está habilitado: {e}")
-
-    # Estratégia 1: Clique normal (sem force)
-    try:
-        share_btn.click(timeout=5000)
-        print("Botão Compartilhar clicado (método normal).")
-        return
-    except Exception as e:
-        print(f"  [Estratégia 1] Clique normal falhou: {e}")
-
-    # Estratégia 2: Force click
-    try:
-        share_btn.click(timeout=5000, force=True)
-        print("Botão Compartilhar clicado (force=True).")
-        return
-    except Exception as e:
-        print(f"  [Estratégia 2] force=True falhou: {e}")
-
-    # Estratégia 3: JS click direto no elemento exato
-    try:
-        clicked = page.evaluate('''() => {
-            const texts = ['Compartilhar', 'Share'];
-            for (const text of texts) {
-                const elements = document.querySelectorAll('div[role="button"], button');
-                for (const el of elements) {
-                    const txt = el.textContent.trim();
-                    if (txt === text) {
-                        // Verificar se não é o botão de background "Compartilhe sua primeira foto"
-                        if (el.closest('[role="dialog"]') || el.closest('[role="presentation"]')) {
-                            el.click();
-                            return 'clicked: ' + txt;
-                        }
-                    }
-                }
-            }
-            // Fallback: clicar no primeiro que tenha texto exato
-            for (const text of texts) {
-                const elements = document.querySelectorAll('div[role="button"], button');
-                for (const el of elements) {
-                    const txt = el.textContent.trim();
-                    if (txt === text && !txt.toLowerCase().includes('primeira')) {
-                        el.click();
-                        return 'fallback clicked: ' + txt;
-                    }
-                }
-            }
-            return null;
-        }''')
-        if clicked:
-            print(f"Botão Compartilhar clicado (via JS direto: {clicked}).")
-            return
-    except Exception as e:
-        print(f"  [Estratégia 3] JS click falhou: {e}")
-
-    # Estratégia 4: dispatch_event (último recurso)
-    try:
-        share_btn.dispatch_event("click")
-        print("Botão Compartilhar clicado (dispatch_event).")
-        return
-    except Exception as e:
-        print(f"  [Estratégia 4] dispatch_event falhou: {e}")
-
-    print("⚠️ Todas as estratégias de clique falharam!")
+def _click_share_button(page, publication: PublicationAttempt) -> None:
+    button = _first_visible_locator(page, [
+        "div[role='button']:text-is('Compartilhar')", "button:text-is('Compartilhar')",
+        "div[role='button']:text-is('Share')", "button:text-is('Share')",
+    ], timeout_ms=15000)
+    publication.before_submit(page)
+    button.click(timeout=30000)
 
 
-def _wait_for_share_confirmation(page, timeout_ms: int = 120000) -> bool:
-    """Espera a confirmação real de que o post foi publicado."""
-    try:
-        DEBUG_SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-        page.screenshot(path=str(DEBUG_SCREENSHOTS_DIR / "debug_ig_before_confirm.png"))
-    except Exception:
-        pass
-
-    # Textos de confirmação que o Instagram exibe quando o reel é publicado
-    confirmation_texts = [
-        "Seu reel foi compartilhado",
-        "Your reel has been shared",
-        "Sua publicação foi compartilhada",
-        "Your post has been shared",
-        "Reel compartilhado",
-        "Reel shared",
-    ]
-
-    try:
-        _first_visible_locator(
-            page,
-            [f"text={t}" for t in confirmation_texts],
-            timeout_ms=timeout_ms,
-        )
-        try:
-            page.screenshot(path=str(DEBUG_SCREENSHOTS_DIR / "debug_ig_success_modal.png"))
-        except Exception:
-            pass
-        return True
-    except Exception:
-        pass
-
-    # Fallback: Verificar se o modal "Compartilhamento" (sharing options) apareceu
-    # Esse modal com "Copiar link", "Facebook", "WhatsApp" etc. aparece APÓS
-    # o post ser publicado com sucesso
-    try:
-        sharing_modal = _first_visible_locator(
-            page,
-            [
-                "text=Compartilhamento",
-                "text=Sharing",
-                "text=Copiar link",
-                "text=Copy link",
-            ],
-            timeout_ms=5000,
-        )
-        if sharing_modal:
-            print("Modal de compartilhamento social detectado — publicação provavelmente realizada!")
-            try:
-                page.screenshot(path=str(DEBUG_SCREENSHOTS_DIR / "debug_ig_sharing_modal.png"))
-            except Exception:
-                pass
-            return True
-    except Exception:
-        pass
-
-    # Capturar screenshot do estado final
-    try:
-        page.screenshot(path=str(DEBUG_SCREENSHOTS_DIR / "debug_ig_failed_modal.png"))
-    except Exception:
-        pass
-
-    return False
+def _wait_for_share_confirmation(page, publication: PublicationAttempt, timeout_ms: int = 120000):
+    return publication.confirm(page, timeout_ms)
 
 
 def _close_confirmation_modal(page) -> None:

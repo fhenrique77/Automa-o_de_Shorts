@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import time as time_module
+import re
 from pathlib import Path
 from typing import Sequence
+from publication import PublicationAttempt, PublicationReceipt, perform_upload
 from utils import build_social_caption
 
 from config import (
@@ -18,30 +20,13 @@ from config import (
 DEBUG_DIR = BASE_DIR / "debug_screenshots"
 
 
-def upload_videos(
-    videos: Sequence[dict[str, object]],
-    caption_limit: int = FACEBOOK_CAPTION_MAX_CHARS,
-) -> list[str]:
-    """
-    Faz upload em lote para o Facebook Reels.
-    """
-    try:
-        from playwright.sync_api import TimeoutError, sync_playwright
-    except ImportError:
-        raise ImportError(
-            "O pacote 'playwright' nao esta instalado."
-        )
-
+def upload_videos(videos: Sequence[dict[str, object]], caption_limit: int = FACEBOOK_CAPTION_MAX_CHARS,
+                  *, on_submitting=None, on_confirmed=None) -> list[PublicationReceipt]:
+    """Return explicit receipts. Never retry a potentially submitted publication."""
+    from playwright.sync_api import TimeoutError, sync_playwright
     if not videos:
         return []
-
-    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-    print("Iniciando automacao em lote do Facebook Reels...")
-    uploaded_refs: list[str] = []
-    failed_refs: list[str] = []
-    attempts = max(1, int(RETRY_ATTEMPTS))
-    delay_seconds = max(0.0, float(RETRY_DELAY_SECONDS))
-
+    receipts = []
     chromium_args = [
         "--disable-blink-features=AutomationControlled",
         "--disable-notifications",
@@ -56,6 +41,7 @@ def upload_videos(
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(FACEBOOK_USER_DATA_DIR),
+            channel="chrome",
             headless=False,
             args=chromium_args,
             locale="pt-BR",
@@ -64,51 +50,24 @@ def upload_videos(
 
         try:
             page = context.new_page()
-
-            for index, video in enumerate(videos, start=1):
+            for video in videos:
                 video_path = Path(str(video["video_path"])).resolve()
-                if not video_path.exists():
+                if not video_path.is_file():
                     raise FileNotFoundError(f"Video nao encontrado em {video_path}")
-
                 title = str(video["title"])
                 description = str(video.get("description", title))
-                caption = build_social_caption(title, description, limit=caption_limit)
-
-                print(f"Enviando Video {index}/{len(videos)} para o Facebook Reels: {title}...")
-                video_uploaded = False
-
-                for attempt in range(1, attempts + 1):
-                    try:
-                        _ensure_logged_in(page, TimeoutError)
-
-                        _upload_single_video(
-                            page=page,
-                            video_file=video_path,
-                            caption=caption,
-                        )
-                        uploaded_refs.append(title)
-                        video_uploaded = True
-                        break
-                    except Exception as exc:
-                        _save_debug_screenshot(page, f"fb_error_attempt_{attempt}")
-                        if attempt >= attempts:
-                            print(f"Falha final ao enviar '{title}' ao Facebook: {exc}")
-                            break
-                        print(
-                            f"Falha ao enviar '{title}' no Facebook na tentativa {attempt}/{attempts}: {exc}"
-                        )
-                        if delay_seconds:
-                            print(f"Tentando novamente em {delay_seconds:.0f} segundos...")
-                            time_module.sleep(delay_seconds)
-
-                if not video_uploaded:
-                    failed_refs.append(title)
-
+                tags = [str(tag) for tag in video.get("tags", [])]
+                _ensure_logged_in(page, TimeoutError)
+                caption = build_social_caption(title, description, limit=caption_limit, tags=tags)
+                publication = PublicationAttempt(
+                    "facebook",
+                    (lambda: on_submitting(video)) if on_submitting else None,
+                    (lambda receipt: on_confirmed(video, receipt)) if on_confirmed else None,
+                )
+                receipts.append(perform_upload(lambda: _upload_single_video(page, video_path, caption, publication), publication))
         finally:
-            print("Fechando navegador Facebook automaticamente...")
             context.close()
-
-    return uploaded_refs
+    return receipts
 
 
 def _save_debug_screenshot(page, label: str) -> None:
@@ -137,28 +96,13 @@ def _ensure_logged_in(page, timeout_error) -> None:
             if loc.count() > 0 and loc.first.is_visible():
                 print("Login detectado no Facebook!")
                 return
-        if "facebook.com" in page.url and "/login" not in page.url:
-            print("Login detectado no Facebook (via URL)!")
-            return
     except Exception:
         pass
 
-    print("\n*** LOGIN NECESSARIO NO FACEBOOK ***")
-    print("Por favor, faca login na janela do navegador.")
-    while True:
-        page.wait_for_timeout(3000)
-        try:
-            if "facebook.com" in page.url and "/login" not in page.url:
-                for sel in logged_in_selectors:
-                    loc = page.locator(sel)
-                    if loc.count() > 0 and loc.first.is_visible():
-                        print("Login do Facebook concluido com sucesso!")
-                        return
-        except Exception:
-            continue
+    raise RuntimeError("Sessao do Facebook expirada; execute login_facebook.py novamente.")
 
 
-def _upload_single_video(page, video_file: Path, caption: str) -> None:
+def _upload_single_video(page, video_file: Path, caption: str, publication: PublicationAttempt) -> None:
     print("Iniciando fluxo de upload no Facebook Reels...")
 
     # 1. Navegar direto para criacao de Reels
@@ -180,17 +124,17 @@ def _upload_single_video(page, video_file: Path, caption: str) -> None:
     page.wait_for_timeout(4000)
     _save_debug_screenshot(page, "fb_reels_step3_editar")
 
-    # 4. Preencher legenda no passo "Editar Reel"
-    print("Preenchendo legenda...")
-    _fill_caption(page, caption)
-    page.wait_for_timeout(2000)
-    _save_debug_screenshot(page, "fb_reels_step4_caption")
-
-    # 5. Clicar Avançar (do step 2 para step 3 - Configurações)
+    # 4. Clicar Avançar (do step 2 para step 3 - Configurações/Legenda)
     print("Clicando Avançar (2/2)...")
     _click_avancar(page)
     page.wait_for_timeout(4000)
-    _save_debug_screenshot(page, "fb_reels_step5_config")
+    _save_debug_screenshot(page, "fb_reels_step4_config")
+
+    # 5. Preencher legenda no passo "Compartilhar Reel"
+    print("Preenchendo legenda...")
+    _fill_caption(page, caption)
+    page.wait_for_timeout(2000)
+    _save_debug_screenshot(page, "fb_reels_step5_caption")
 
     # 5.5 Definir publico como "Publico"
     print("Configurando privacidade para Publico...")
@@ -199,30 +143,20 @@ def _upload_single_video(page, video_file: Path, caption: str) -> None:
 
     # 6. Publicar
     print("Publicando...")
-    _click_publish(page)
+    _click_publish(page, publication)
 
     # 7. Aguardar confirmacao
     print("Aguardando upload finalizar...")
-    _wait_for_upload_complete(page)
+    _wait_for_upload_complete(page, publication)
 
     print("Upload concluido com sucesso via Facebook Reels!")
 
 
 def _click_avancar(page) -> None:
     """Clica no botão 'Avançar' ou 'Next'."""
-    try:
-        page.evaluate('''() => {
-            const buttons = document.querySelectorAll('div[role="button"]');
-            for (const btn of buttons) {
-                const txt = (btn.innerText || '').trim();
-                if (txt === 'Avançar' || txt === 'Next') {
-                    btn.click();
-                    return;
-                }
-            }
-        }''')
-    except Exception as e:
-        print(f"Erro ao tentar clicar em Avançar: {e}")
+    button = page.get_by_role("button", name=re.compile(r"^(Avançar|Next|Seguinte)$", re.I)).first
+    button.wait_for(state="visible", timeout=30000)
+    button.click(timeout=10000)
 
 
 def _fill_caption(page, caption: str) -> None:
@@ -316,57 +250,30 @@ def _attach_video(page, video_file: Path) -> None:
             print(f"Falha na injecao via JS: {e}")
 
     if not injected:
+        try:
+            target = page.get_by_text(re.compile(r"Adicione um v[ií]deo|Add a video", re.I)).first
+            with page.expect_file_chooser(timeout=10000) as chooser:
+                target.click(timeout=10000)
+            chooser.value.set_files(str(video_file))
+            injected = True
+            print("Video anexado pelo seletor de arquivo do Facebook.")
+        except Exception as exc:
+            print(f"Seletor de arquivo do Facebook indisponivel: {exc}")
+
+    if not injected:
         raise RuntimeError("Nao foi possivel anexar o video ao Facebook por nenhum metodo.")
 
 
-def _click_publish(page) -> None:
-    """Clica no botao 'Postar' / 'Publish'."""
-    try:
-        page.evaluate('''() => {
-            const buttons = document.querySelectorAll('div[role="button"]');
-            for (const btn of buttons) {
-                const txt = (btn.innerText || '').trim();
-                if (txt === 'Postar' || txt === 'Publish') {
-                    btn.click();
-                    return;
-                }
-            }
-        }''')
-        print("Botao Postar clicado via JS.")
-    except Exception as e:
-        print(f"Erro ao tentar clicar em Postar: {e}")
+def _click_publish(page, publication: PublicationAttempt) -> None:
+    import re
+    button = page.get_by_role("button", name=re.compile(r"^(Postar|Publicar|Publish|Post)$")).last
+    button.wait_for(state="visible", timeout=30000)
+    publication.before_submit(page)
+    button.click(timeout=30000)
 
 
-def _wait_for_upload_complete(page) -> None:
-    """Aguarda sucesso verificando a saida do /reels/create ou mudancas na URL."""
-    deadline = time_module.monotonic() + 180  # 3 minutos max
-
-    while time_module.monotonic() < deadline:
-        page.wait_for_timeout(3000)
-
-        # O Facebook geralmente redireciona a pagina ou exibe um toast de confirmacao
-        if "reels/create" not in page.url:
-            print("Redirecionamento detectado! Post provavelmente concluido.")
-            _save_debug_screenshot(page, "fb_success")
-            page.wait_for_timeout(5000)
-            return
-
-        try:
-            # Verifica toasts de sucesso
-            success_texts = ["publicado", "posted", "seu reel", "your reel", "compartilhado"]
-            for txt in success_texts:
-                toast = page.locator(f"div:has-text('{txt}')")
-                if toast.count() > 0:
-                    print(f"Confirmacao detectada: '{txt}'")
-                    _save_debug_screenshot(page, "fb_success_toast")
-                    page.wait_for_timeout(3000)
-                    return
-        except Exception:
-            pass
-
-    print("Tempo limite atingido (3 min). O reel pode nao ter sido enviado.")
-    _save_debug_screenshot(page, "fb_timeout")
-    page.wait_for_timeout(3000)
+def _wait_for_upload_complete(page, publication: PublicationAttempt):
+    return publication.confirm(page, timeout_ms=180000)
 
 
 def _set_audience_to_public(page) -> None:

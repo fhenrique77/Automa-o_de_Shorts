@@ -18,6 +18,10 @@ browser_data_facebook/
 browser_data_instagram/
 browser_data_meta/
 browser_data_tiktok/
+browser_data*/
+.env
+.env.*
+!.env.example
 
 # Temporary directories for video processing
 temp_videos/
@@ -26,9 +30,11 @@ temp_clips/
 # Logs and local configurations/states
 automacao.log
 historico.json
+publicacoes.sqlite3*
 source_schedules.json
 authorized_sources.txt
 debug_screenshots/
+.podcast_automation.lock
 
 # Local IDE settings
 .vscode/

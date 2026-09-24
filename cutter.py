@@ -37,7 +37,7 @@ from config import (
     WHISPER_LANGUAGE,
     WHISPER_MODEL,
 )
-from utils import resolve_ffmpeg_executable, resolve_ytdlp_js_runtimes
+from utils import resolve_ffmpeg_executable, resolve_ytdlp_js_runtimes, validate_video_clip
 
 CONTENT_HASHTAG_RULES = (
     # Financas e negocios
@@ -672,6 +672,7 @@ def cut_clip(
         message = stderr_text or stdout_text or "Falha desconhecida ao cortar o clipe."
         raise RuntimeError(message) from exc
 
+    validate_video_clip(clip_file)
     return clip_file
 
 
@@ -1010,7 +1011,7 @@ def _build_clip_plan_ai_with_timeout(
     min_duration: float,
     max_duration: float,
     api_key: str,
-    timeout_seconds: int = 30,
+    timeout_seconds: int = 90,
 ) -> list[dict[str, float | str]]:
     result: list[dict[str, float | str]] | None = None
     error: Exception | None = None

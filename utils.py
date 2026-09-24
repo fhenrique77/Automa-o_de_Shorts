@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import importlib
-import json
+import re
 import shutil
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from config import HISTORY_FILE, HISTORY_VIDEO_DAYS, HISTORY_CLIP_DAYS
+from config import HISTORY_FILE, HISTORY_VIDEO_DAYS, HISTORY_CLIP_DAYS, PUBLICATION_DB
+from publication_store import PublicationStore
 
 
 def resolve_ffmpeg_executable() -> str:
@@ -43,36 +45,49 @@ def resolve_ytdlp_js_runtimes() -> dict[str, dict[str, str]]:
     return {}
 
 
+def validate_video_clip(path: str | Path, *, minimum_duration: float = 0) -> None:
+    """Require video and audio frames at both ends of a sufficiently long file."""
+    media = Path(path)
+    if not media.is_file() or not media.stat().st_size:
+        raise RuntimeError(f"Arquivo de video ausente ou vazio: {media}")
+    ffmpeg = resolve_ffmpeg_executable()
+    for seek_tail in (False, True):
+        if seek_tail:
+            probe = subprocess.run([ffmpeg, "-hide_banner", "-i", str(media)],
+                                   capture_output=True, text=True, errors="replace")
+            match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", probe.stderr or "")
+            if not match:
+                raise RuntimeError(f"Duracao do video nao identificada: {media}")
+            hours, minutes, seconds = match.groups()
+            duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+            if duration + 0.5 < minimum_duration:
+                raise RuntimeError(f"Video menor que o trecho esperado: {media}")
+            if duration <= 3:
+                break
+        for kind, filter_name in (("v", "showinfo"), ("a", "ashowinfo")):
+            command = [ffmpeg, "-hide_banner", "-loglevel", "info"]
+            if seek_tail:
+                command.extend(["-sseof", "-2"])
+            command.extend(["-i", str(media), "-map", f"0:{kind}:0",
+                            f"-frames:{kind}", "1",
+                            f"-{'vf' if kind == 'v' else 'af'}", filter_name,
+                            "-f", "null", "-"])
+            result = subprocess.run(command, capture_output=True, text=True, errors="replace")
+            diagnostics = result.stderr or ""
+            if result.returncode or f"Parsed_{filter_name}" not in diagnostics or " n:" not in diagnostics:
+                stream = "video" if kind == "v" else "audio"
+                location = "no fim" if seek_tail else "no inicio"
+                raise RuntimeError(f"Arquivo sem quadro decodificavel de {stream} {location}: {media}")
+
+
 # ---------------------------------------------------------------------------
 #  Sistema de histórico para detecção de duplicatas
 # ---------------------------------------------------------------------------
 
 def load_history() -> list[dict[str, Any]]:
-    """Carrega o historico de clipes publicados."""
-    if not HISTORY_FILE.exists():
-        return []
-    try:
-        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, OSError):
-        return []
-
-
-def save_history(history: list[dict[str, Any]]) -> None:
-    """Salva o historico de clipes publicados, removendo entradas expiradas."""
-    cutoff = datetime.now() - timedelta(days=max(HISTORY_VIDEO_DAYS, HISTORY_CLIP_DAYS))
-    cutoff_str = cutoff.isoformat()
-
-    # Remove entradas mais antigas que o maior dos dois períodos
-    cleaned = [
-        entry for entry in history
-        if entry.get("posted_at", "") >= cutoff_str
-    ]
-
-    HISTORY_FILE.write_text(
-        json.dumps(cleaned, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    """Load transactional history and queue reservations; fail closed on corruption."""
+    with PublicationStore(PUBLICATION_DB, HISTORY_FILE) as store:
+        return store.history()
 
 
 def is_video_used(video_id: str, history: list[dict[str, Any]] | None = None) -> bool:
@@ -126,37 +141,6 @@ def is_clip_duplicate(
     return False
 
 
-def record_clips(
-    video_id: str,
-    video_url: str,
-    clips: list[dict[str, Any]],
-    platforms: list[str],
-) -> None:
-    """Registra clipes publicados no historico."""
-    history = load_history()
-    now = datetime.now().isoformat()
-
-    for clip in clips:
-        # Extrai apenas campos serializaveis (upload_queue pode conter Path objects)
-        clip_start = clip.get("start", 0)
-        clip_end = clip.get("end", 0)
-        clip_title = str(clip.get("title", ""))
-
-        entry = {
-            "video_id": video_id,
-            "video_url": video_url,
-            "start": float(clip_start) if clip_start else 0,
-            "end": float(clip_end) if clip_end else 0,
-            "title": clip_title,
-            "platforms": platforms,
-            "posted_at": now,
-        }
-        history.append(entry)
-
-    save_history(history)
-    print(f"Historico atualizado: {len(clips)} clipe(s) registrado(s) para o video {video_id}.")
-
-
 def filter_unused_videos(
     video_urls: list[str],
     extract_id_fn,
@@ -180,8 +164,8 @@ def filter_unused_videos(
             print(f"Filtro de duplicatas: {skipped} video(s) ja usado(s) recentemente, {len(unused)} disponivel(is).")
         return unused
 
-    print("Todos os videos candidatos ja foram usados recentemente. Permitindo reutilizacao.")
-    return video_urls
+    print("Todos os videos candidatos ja foram usados recentemente; fonte ignorada.")
+    return []
 
 
 def filter_duplicate_clips(
@@ -191,7 +175,7 @@ def filter_duplicate_clips(
 ) -> list[dict[str, Any]]:
     """
     Remove clipes que ja foram publicados recentemente.
-    Se todos forem duplicatas, retorna a lista original.
+    Se todos forem duplicatas, retorna uma lista vazia.
     """
     if history is None:
         history = load_history()
@@ -207,8 +191,8 @@ def filter_duplicate_clips(
             print(f"Filtro de duplicatas: {removed} clipe(s) duplicado(s) removido(s), {len(unique)} unico(s).")
         return unique
 
-    print("Todos os clipes são duplicatas recentes. Permitindo reutilizacao para nao travar.")
-    return clips
+    print("Todos os clipes sao duplicatas recentes; nenhum sera publicado.")
+    return []
 
 
 def build_social_caption(title: str, description: str, limit: int, tags: list[str] | None = None) -> str:

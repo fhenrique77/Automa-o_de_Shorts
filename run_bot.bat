@@ -17,3 +17,4 @@ if not defined FFMPEG_DIR (
 )
 
 "..\.venv\Scripts\python.exe" "main.py" >> "automacao.log" 2>&1
+exit /b %ERRORLEVEL%
