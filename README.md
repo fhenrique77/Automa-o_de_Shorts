@@ -163,11 +163,15 @@ histórico inválido bloqueia a primeira importação, em vez de liberar republi
 Registros antigos conservam os resultados declarados pela versão anterior; a
 migração não verifica retroativamente esses posts.
 
-Na execução normal, o bot atende a fila existente antes de buscar novas fontes.
+Na execução normal, o bot atende entregas pendentes ou falhas antes de buscar novas fontes.
 Se publicou no YouTube e falhou antes de publicar no Instagram, a próxima execução
 tenta somente o Instagram, sem baixar ou renderizar novamente. Somente plataformas
 habilitadas em `config.py` são atendidas. Cada envio usa sua própria sessão de
 navegador e persiste a confirmação antes de fechar essa sessão.
+Entregas incertas permanecem reservadas e não são reenviadas automaticamente.
+Quando só restam entregas incertas, o agendamento pode gerar novos cortes;
+a reserva de fonte e intervalo evita reutilizar o conteúdo enquanto a revisão
+estiver pendente.
 
 Os estados exibidos são:
 
@@ -229,7 +233,8 @@ reenvios. Para backup, pare o bot e preserve o banco junto de seus arquivos auxi
 
 ## 📅 Agendamento de Execução
 
-Você pode agendar o bot para rodar de forma invisível nos horários de pico (configurado por padrão para 3 vezes ao dia: 12:15, 16:45 e 18:30) rodando o setup de agendamento:
+Você pode agendar o bot para rodar de forma invisível três vezes ao dia: 11:30,
+16:45 e 18:30 (horário local do Windows). Para instalar as tarefas:
 
 ```bash
 python setup_agendamento.py

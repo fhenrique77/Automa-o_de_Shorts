@@ -29,19 +29,7 @@ TASK_PREFIX = "PodcastAutomation"
 WORK_DIR = str(Path(__file__).resolve().parent)
 VBS_PATH = str(Path(WORK_DIR) / "run_bot_silent.vbs")
 
-# Horários de postagem — calibrados para o mercado brasileiro 2026 (BRT)
-#
-# Estratégia aplicada da pesquisa:
-#   - Pico TikTok BR: ter-qui 16h-21h (quarta = melhor dia absoluto)
-#   - Pico YouTube Shorts BR: 12h-15h e 19h-22h
-#   - Estratégia "Off-Peak": postar 45min ANTES do pico para evitar saturação do feed
-#     Ex: 18h15 captura audiência antes do rush das 19h com menos concorrência
-#
-# Slots escolhidos (cobrem todos os picos primários identificados):
-#   12h45 → captura almoço (12h-15h Shorts) antes do rush
-#   15h15 → janela vespertina TikTok (terça/quarta 16h) — antecipada
-#   17h45 → pré-pico noturno TikTok (17h-19h) — máxima eficiência anti-saturação
-#   20h15 → rolagem noturna (19h-22h) — zona dourada entretenimento BR
+# Horarios diarios no fuso local configurado no Windows.
 HORARIOS = [
     "11:30",
     "16:45",

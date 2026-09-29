@@ -701,13 +701,16 @@ def run_pipeline(args: argparse.Namespace, workspace: TempWorkspace, store: Publ
         if counts['failed'] or counts['uncertain']:
             raise RuntimeError("Fila preservada: ha entregas com falha ou publicacao incerta.")
 
-    backlog = [row for row in store.list_deliveries()
-               if row['platform'] in uploaders and row['state'] in {'pending', 'failed', 'uncertain'}]
+    queued = [row for row in store.list_deliveries() if row['platform'] in uploaders]
+    backlog = [row for row in queued if row['state'] in {'pending', 'failed'}]
+    uncertain = [row for row in queued if row['state'] == 'uncertain']
     if not args.dry_run and not args.input_video and (backlog or getattr(args, 'retry_pending', False)):
         deliver()
-        if any(row['state'] == 'uncertain' for row in backlog):
-            print("Ha entregas incertas. Use --queue-status e revise a plataforma antes de liberar reenvio.")
         return
+
+    if uncertain and not args.dry_run and not args.input_video:
+        print("Ha entregas incertas preservadas. Use --queue-status para revisa-las; "
+              "novos cortes podem ser gerados sem reenviar essas entregas.")
 
     if args.input_video:
         queue, _, original = _build_local_upload_queue(args)
